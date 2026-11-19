@@ -8,9 +8,26 @@ use Illuminate\Http\Request;
 
 class GameController extends Controller
 {
+    public function home()
+    {
+        // Cached briefly: the front page is the most-hit route and these are
+        // aggregate counts that do not need to be live to the second.
+        $data = cache()->remember('home.stats', 300, fn () => [
+            'players' => User::count(),
+            'games' => Game::count(),
+            'top' => User::query()->withSum('games as points', 'points')->has('games')
+                ->orderByDesc('points')->limit(5)->get(['id', 'name', 'avatar'])
+                ->map(fn ($u) => ['name' => $u->name, 'avatar' => $u->avatar, 'points' => (int) $u->points])->all(),
+        ]);
+
+        return view('home', $data);
+    }
+
     public function play()
     {
-        return view('play');
+        return view('play', [
+            'total' => auth()->check() ? (int) auth()->user()->games()->sum('points') : null,
+        ]);
     }
 
     public function store(Request $request)

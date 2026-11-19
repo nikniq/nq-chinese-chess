@@ -1,8 +1,9 @@
 @extends('layouts.app')
 @section('title', 'Log in')
 @section('content')
-<div class="card narrow">
+<div class="card narrow auth-card">
     <h1>Log in</h1>
+    @include('auth._oauth')
     <form method="POST" action="{{ route('login') }}">
         @csrf
         <label>Email <input type="email" name="email" value="{{ old('email') }}" required autofocus></label>

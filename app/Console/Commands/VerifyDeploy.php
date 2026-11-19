@@ -46,7 +46,7 @@ class VerifyDeploy extends Command
         $this->check('bootstrap/cache writable', fn () => is_writable(base_path('bootstrap/cache')));
 
         $this->check('public path is public_html', fn () => basename(public_path()) === 'public_html');
-        $this->check('game assets present', fn () => is_file(public_path('js/xiangqi.js')) && is_file(public_path('css/app.css')));
+        $this->check('game assets present', fn () => is_file(public_path('js/xiangqi.js')) && is_file(public_path('js/engine.js')) && is_file(public_path('css/app.css')));
 
         $this->check('APP_KEY set', fn () => filled(config('app.key')));
 

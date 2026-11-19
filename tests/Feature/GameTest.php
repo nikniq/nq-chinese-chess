@@ -12,7 +12,7 @@ class GameTest extends TestCase
 
     public function test_guest_can_play_but_not_save(): void
     {
-        $this->get('/')->assertOk()->assertSee('Playing as guest');
+        $this->get('/play')->assertOk()->assertSee('Playing as a guest');
         $this->postJson('/games', ['result' => 'win', 'difficulty' => 2, 'moves' => 20])->assertUnauthorized();
     }
 
@@ -21,7 +21,7 @@ class GameTest extends TestCase
         $this->post('/register', [
             'name' => 'Tester', 'email' => 't@example.com',
             'password' => 'secret123', 'password_confirmation' => 'secret123',
-        ])->assertRedirect('/');
+        ])->assertRedirect('/play');
         $this->assertAuthenticated();
 
         $this->postJson('/games', ['result' => 'win', 'difficulty' => 3, 'moves' => 30, 'points' => 9999])
@@ -34,7 +34,7 @@ class GameTest extends TestCase
     public function test_login(): void
     {
         $user = User::factory()->create(['password' => 'secret123']);
-        $this->post('/login', ['email' => $user->email, 'password' => 'secret123'])->assertRedirect('/');
+        $this->post('/login', ['email' => $user->email, 'password' => 'secret123'])->assertRedirect('/play');
         $this->assertAuthenticatedAs($user);
     }
 }

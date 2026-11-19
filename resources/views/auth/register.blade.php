@@ -1,8 +1,10 @@
 @extends('layouts.app')
 @section('title', 'Register')
 @section('content')
-<div class="card narrow">
-    <h1>Register</h1>
+<div class="card narrow auth-card">
+    <h1>Create your free account</h1>
+    <p class="muted">Save every win and climb the leaderboard.</p>
+    @include('auth._oauth')
     <form method="POST" action="{{ route('register') }}">
         @csrf
         <label>Name <input type="text" name="name" value="{{ old('name') }}" required autofocus maxlength="50"></label>
