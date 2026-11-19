@@ -1,0 +1,35 @@
+#!/bin/bash
+#================================================================
+# Settings for cx.sh (the LOCAL assistant). Copy and fill in:
+#
+#   cp vars.sh.example vars.sh && chmod 600 vars.sh
+#
+# vars.sh is gitignored — it names hosts and accounts. This example holds
+# placeholders only.
+#================================================================
+
+# --- Identity ------------------------------------------------------------
+PROJECT="chess.example.com"            # dir under ~/.ssh/remote/ and ~/www/
+REMOTE_USER="your-ssh-user"
+REMOTE_HOST="your-host.example.com"
+REMOTE="$REMOTE_USER@$REMOTE_HOST"
+REMOTE_PORT="22"                       # SiteGround uses 18765
+
+# App root on the server, relative to ~ (where deploy.sh and .env live).
+REMOTE_APP="www/$PROJECT"
+
+# Public URL that options 30 and 42 check.
+APP_URL="https://$PROJECT"
+
+# Where deploy.sh keeps database backups, relative to ~. Must match
+# deploy.sh's BACKUP_DIR (default ~/backups/<app dir name>).
+REMOTE_BACKUPS="backups/$PROJECT"
+
+# --- Tooling -------------------------------------------------------------
+APP_SSH="ssh -p $REMOTE_PORT"
+APP_SCP="scp -P $REMOTE_PORT"
+
+# --- Local paths ---------------------------------------------------------
+# Where options 01/03/99 copy baseline dotfiles and bk.sh from.
+LOCAL_SCRIPTS_DEFAULT="$HOME/.ssh/remote/default"
+LOG_OUTPUT="./log/remote.out"
