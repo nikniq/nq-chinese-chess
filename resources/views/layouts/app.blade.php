@@ -38,7 +38,7 @@
                     @endif
                     {{ auth()->user()->name }}
                 </span>
-                <form method="POST" action="{{ route('logout') }}" class="inline">
+                <form method="POST" action="{{ route('logout') }}" class="inline" id="logout-form">
                     @csrf
                     <button type="submit" class="linkish">Log out</button>
                 </form>
@@ -51,6 +51,9 @@
 </header>
 
 <main id="main" class="@yield('mainClass', 'container')">
+    @if (session('status'))
+        <div class="flash" role="status">{{ session('status') }}</div>
+    @endif
     @yield('content')
 </main>
 

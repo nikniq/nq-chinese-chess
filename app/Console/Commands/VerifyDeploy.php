@@ -60,6 +60,9 @@ class VerifyDeploy extends Command
         if (app()->environment('production')) {
             $this->check('APP_DEBUG off in production', fn () => config('app.debug') === false);
             $this->check('APP_URL is https', fn () => str_starts_with((string) config('app.url'), 'https://'));
+            // Registration needs real email delivery for verification links.
+            $this->check('mail can deliver verification emails', fn () => ! in_array(config('mail.default'), ['log', 'array'], true)
+                && ! str_ends_with((string) config('mail.from.address'), '@example.com'));
         } else {
             $this->line('  · not production ('.app()->environment().') — skipped debug/https checks');
         }

@@ -26,6 +26,13 @@ Route::middleware('guest')->group(function () {
 
 Route::middleware('auth')->group(function () {
     Route::post('/logout', [AuthController::class, 'logout'])->name('logout');
+    Route::get('/email/verify', [AuthController::class, 'verifyNotice'])->name('verification.notice');
+    Route::get('/email/verify/{id}/{hash}', [AuthController::class, 'verify'])->middleware(['signed', 'throttle:6,1'])->name('verification.verify');
+    Route::post('/email/verification-notification', [AuthController::class, 'resendVerification'])->middleware('throttle:3,1')->name('verification.send');
+});
+
+// Scores are only recorded for verified accounts (Google/Nikniq sign-ins are verified automatically).
+Route::middleware(['auth', 'verified'])->group(function () {
     Route::post('/games', [GameController::class, 'store'])->middleware('throttle:30,1')->name('games.store');
     Route::get('/history', [GameController::class, 'history'])->name('history');
 });

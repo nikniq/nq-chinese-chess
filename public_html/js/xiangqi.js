@@ -282,6 +282,10 @@
 
   async function saveResult(result) {
     const out = el('resultScore');
+    if (window.APP.unverified) {
+      out.innerHTML = `<a href="${window.APP.verifyUrl}">Verify your email</a> to save games like this.`;
+      return;
+    }
     if (!window.APP.loggedIn) {
       out.innerHTML = `Sign in to put games like this on the <a href="${window.APP.leaderboardUrl}">leaderboard</a>.`;
       return;

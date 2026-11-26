@@ -3,6 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\User;
+use Illuminate\Auth\Events\Registered;
+use Illuminate\Foundation\Auth\EmailVerificationRequest;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Validation\Rules\Password;
@@ -44,10 +46,35 @@ class AuthController extends Controller
         ]);
 
         $user = User::create($data);
+        event(new Registered($user)); // sends the verification email
         Auth::login($user);
         $request->session()->regenerate();
 
-        return redirect()->route('play');
+        return redirect()->route('verification.notice');
+    }
+
+    public function verifyNotice(Request $request)
+    {
+        return $request->user()->hasVerifiedEmail()
+            ? redirect()->route('play')
+            : view('auth.verify-email');
+    }
+
+    public function verify(EmailVerificationRequest $request)
+    {
+        $request->fulfill();
+
+        return redirect()->route('play')->with('status', 'Email verified. Your games now count towards the leaderboard.');
+    }
+
+    public function resendVerification(Request $request)
+    {
+        if ($request->user()->hasVerifiedEmail()) {
+            return redirect()->route('play');
+        }
+        $request->user()->sendEmailVerificationNotification();
+
+        return back()->with('status', 'A new verification link has been sent to '.$request->user()->email.'.');
     }
 
     public function logout(Request $request)

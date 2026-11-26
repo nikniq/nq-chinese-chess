@@ -52,7 +52,10 @@
         <label class="check"><input type="checkbox" id="sound" checked> Sound</label>
 
         <div @class(["score-box", "guest" => auth()->guest()])>
-            @auth
+            @if (auth()->check() && ! auth()->user()->hasVerifiedEmail())
+                <span>Verify your email to save scores.</span>
+                <a href="{{ route('verification.notice') }}">Resend the link</a>
+            @elseauth
                 <span>Your points</span><strong id="scoreTotal">{{ number_format($total) }}</strong>
             @else
                 <span>Playing as a guest.</span>
@@ -71,7 +74,9 @@
 @push('scripts')
 <script>
     window.APP = {
-        loggedIn: @json(auth()->check()),
+        loggedIn: @json(auth()->check() && auth()->user()->hasVerifiedEmail()),
+        unverified: @json(auth()->check() && ! auth()->user()->hasVerifiedEmail()),
+        verifyUrl: @json(route('verification.notice')),
         saveUrl: @json(route('games.store')),
         leaderboardUrl: @json(route('leaderboard')),
         engineUrl: @json(asset('js/engine.js').'?v='.@filemtime(public_path('js/engine.js'))),
