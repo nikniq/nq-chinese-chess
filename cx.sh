@@ -9,8 +9,11 @@
 # ⚠ Runs on your LOCAL machine only — never copy this to the server.
 #   Its counterpart on the server is deploy.sh.
 #
-# Requires a vars.sh next to it (copy vars.sh.example). vars.sh is
-# gitignored because it names hosts and accounts.
+# Needs no settings file. It connects through the ssh alias "nq" from your
+# ~/.ssh/config (host, user, port 18765 and key live there, not in this repo).
+# Override any setting for one run with an environment variable, e.g.
+#   CX_REMOTE=other-alias ./cx.sh 39
+# or permanently in an optional, gitignored vars.sh next to this script.
 #
 # Version 3.0 (ported from the as-website1 cx.sh v2.4)
 # - dropped the options for commands this app does not have (pricing,
@@ -43,28 +46,50 @@
 #   recent errors, newest backup and disk use — the first thing to run
 # - 43/44 score audit and voiding a cheated game (scores come from the browser)
 # - 94 restore a backup, 95 schedule a daily backup on the server
+#
+# Version 3.2
+# - vars.sh is no longer required: the settings below are built in, and the
+#   connection details come from the "nq" alias in ~/.ssh/config
+# - the run-on-the-server guard checks whether it is running inside the
+#   server's app folder, instead of comparing against a host name from vars.sh
 #================================================================
 clear
 cd "$(dirname "$0")"
 
-if [ ! -f ./vars.sh ]; then
-  echo "vars.sh not found next to cx.sh — copy vars.sh.example to vars.sh and fill it in."
-  exit 1
-fi
-source ./vars.sh
+# Optional per-machine overrides (gitignored). Not needed for normal use.
+[ -f ./vars.sh ] && source ./vars.sh
 
-# Defaults so a minimal vars.sh works.
-REMOTE_APP="${REMOTE_APP:-www/$PROJECT}"
-APP_URL="${APP_URL:-https://$PROJECT}"
+# Built-in settings; a CX_* environment variable wins over each.
+PROJECT="${CX_PROJECT:-${PROJECT:-chinese-chess.nikniq.com}}"
+REMOTE="${CX_REMOTE:-${REMOTE:-nq}}"                    # ssh alias in ~/.ssh/config
+REMOTE_APP="${CX_REMOTE_APP:-${REMOTE_APP:-www/$PROJECT}}"
+APP_URL="${CX_APP_URL:-${APP_URL:-https://$PROJECT}}"
+LOCAL_SCRIPTS_DEFAULT="${LOCAL_SCRIPTS_DEFAULT:-$HOME/.ssh/remote/default}"
 LOG_OUTPUT="${LOG_OUTPUT:-./log/remote.out}"
 REMOTE_BACKUPS="${REMOTE_BACKUPS:-backups/$(basename "$REMOTE_APP")}"
 APP_SSH="${APP_SSH:-ssh}"
 APP_SCP="${APP_SCP:-scp}"
 
-if [ "$(hostname -s 2>/dev/null)" = "${REMOTE_HOST%%.*}" ]; then
-  echo "⚠ This looks like $REMOTE_HOST — cx.sh is the LOCAL script. Use deploy.sh here."
+# On the server this script would ssh to itself; deploy.sh is the tool there.
+if [ "$PWD" = "$HOME/$REMOTE_APP" ]; then
+  echo "⚠ You are in the server's app folder — cx.sh is the LOCAL script. Use ./deploy.sh here."
   exit 1
 fi
+
+# Fail early, with a useful message, if the ssh alias is missing.
+case "${1:-}" in qq|99) ;; *)
+  # ssh -G resolves the alias; with no matching Host block, hostname stays the alias itself.
+  if [ "$(ssh -G "$REMOTE" 2>/dev/null | awk '$1=="hostname"{print $2}')" = "$REMOTE" ] && [[ "$REMOTE" != *.* ]]; then
+    echo "⚠ No ssh alias '$REMOTE' in ~/.ssh/config. Add one, e.g.:"
+    echo "    Host $REMOTE"
+    echo "      HostName ssh.your-siteground-host"
+    echo "      User your-ssh-user"
+    echo "      Port 18765"
+    echo "      IdentityFile ~/.ssh/id_rsa"
+    echo "  or point cx.sh at another alias: CX_REMOTE=alias ./cx.sh"
+    exit 1
+  fi ;;
+esac
 
 #---------------------------------------------------------------
 # Helpers
@@ -146,7 +171,7 @@ smoke_or_advise() {
 }
 
 echo =============================================================
-echo "Hi $USER@$HOSTNAME — acting on $PROJECT ($REMOTE)"
+echo "Hi $USER@$HOSTNAME — acting on $PROJECT (ssh $REMOTE:~/$REMOTE_APP)"
 echo What do you want to do?
 echo -------------------------------------------------------------
 echo "DEPLOY"
@@ -554,7 +579,7 @@ case "$SELECTION" in
     case "$k" in *.pub) chmod 644 "$k" ;; *) chmod 600 "$k" ;; esac
   done
   [ -e ~/.ssh/authorized_keys ] && chmod 600 ~/.ssh/authorized_keys
-  chmod 600 ./vars.sh
+  [ -f ./vars.sh ] && chmod 600 ./vars.sh
   log_history "Refreshed files from default"
   ;;
 

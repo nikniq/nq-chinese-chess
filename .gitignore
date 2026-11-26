@@ -26,7 +26,7 @@ Homestead.json
 Homestead.yaml
 Thumbs.db
 
-# Ops scripts: vars.sh names hosts and accounts; log/ and backup/ are local output
+# Ops scripts: optional cx.sh overrides (vars.sh); log/ and backup/ are local output
 /vars.sh
 /log/
 /backup/

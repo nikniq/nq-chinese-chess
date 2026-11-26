@@ -47,6 +47,15 @@
 #   automatically; a dropped connection no longer stops a deploy half-way;
 #   the cleanup that releases the lock and lifts maintenance mode can no
 #   longer be killed by writing to a terminal that has gone
+#
+# Version 3.3 (SiteGround fixes)
+# - fixed: every run died at the transcript line with "/dev/fd/63: No such
+#   file or directory" — SiteGround has no /dev/fd, so `exec > >(tee)` cannot
+#   work there. Output is now captured through an ordinary pipe
+# - the stale-lock check reads /proc instead of `ps`, which SiteGround lacks
+# - composer install runs when composer.lock is newer than vendor/, and the
+#   pre-migration backup runs when Laravel reports pending migrations — both
+#   from the server's real state, so they still happen after a manual pull
 #================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -148,7 +157,34 @@ fi
 # Changing modes: take the lock
 #---------------------------------------------------------------
 mkdir -p "$(dirname "$LOCK_FILE")" storage/logs
+TRANSCRIPT="storage/logs/deploy-last.out"
+
+# Keep everything this run prints, for reading after the terminal is gone
+# (cx.sh 38). The script re-runs itself with its output piped through tee.
+# A plain pipe, not `exec > >(tee …)`: SiteGround's shell has no /dev/fd,
+# so process substitution fails there — that failure is what killed the
+# first v3.1 deploys and left their lock behind.
+if [ -z "${DEPLOY_CHILD:-}" ]; then
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') ./deploy.sh $* ===" > "$TRANSCRIPT"
+  # tee -p keeps writing the file if the terminal goes (GNU coreutils 8.24+).
+  if tee -p /dev/null </dev/null >/dev/null 2>&1; then TEE="tee -p"; else TEE="tee"; fi
+  # A dropped ssh connection sends SIGHUP: neither this wrapper nor tee may die
+  # from it, or the deploy underneath would lose its output pipe half-way.
+  trap '' HUP
+  set +e
+  DEPLOY_CHILD=1 bash "$PWD/$(basename "$0")" "$@" 2>&1 | ( trap '' HUP PIPE; $TEE -a "$TRANSCRIPT" 2>/dev/null )
+  exit "${PIPESTATUS[0]}"
+fi
+
 WENT_DOWN=0
+
+# Is <pid> a running deploy.sh? SiteGround has no `ps`, so read /proc first.
+lock_holder_alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/cmdline" ]; then tr '\0' ' ' < "/proc/$1/cmdline" | grep -q 'deploy\.sh'; return; fi
+  if command -v ps >/dev/null 2>&1; then ps -p "$1" -o args= 2>/dev/null | grep -q 'deploy\.sh'; return; fi
+  return 0  # alive and cannot tell what it is: assume it is a deploy
+}
 
 # The lock holds "<pid> <start time>". A lock whose process is gone is left
 # over from a run that was killed (closed terminal, dropped ssh, kill -9) and
@@ -157,11 +193,11 @@ WENT_DOWN=0
 if [ -f "$LOCK_FILE" ]; then
   read -r LPID LREST < "$LOCK_FILE" || true
   if [[ "$LPID" =~ ^[0-9]+$ ]]; then
-    if kill -0 "$LPID" 2>/dev/null && ps -p "$LPID" -o args= 2>/dev/null | grep -q 'deploy\.sh'; then
+    if lock_holder_alive "$LPID"; then
       die "A deploy is running right now (pid $LPID, started $LREST). Wait for it, or stop it with: kill $LPID"
     fi
   elif [ -n "$(find "$LOCK_FILE" -mmin -30 2>/dev/null)" ]; then
-    die "A deploy started at $(cat "$LOCK_FILE") may still be running. Check with: ps -u \$USER -o pid,args | grep '[d]eploy.sh' — if nothing shows, delete $LOCK_FILE and retry."
+    die "A deploy started at $(cat "$LOCK_FILE") may still be running. If you are sure none is, delete $LOCK_FILE and retry."
   fi
   warn "Clearing a stale lock from a run that did not finish (started $(cat "$LOCK_FILE"))."
   warn "What it was doing: tail storage/logs/deploy.log storage/logs/deploy-last.out"
@@ -194,7 +230,6 @@ cleanup() {
   fi
 }
 # Installed straight after taking the lock, so no exit path can skip it.
-TRANSCRIPT="storage/logs/deploy-last.out"
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -202,11 +237,6 @@ trap 'exit 143' TERM
 # stopping half-way through a pull or migration, so carry on.
 trap '' HUP
 
-# Keep everything this run prints, for reading after the terminal is gone.
-# tee -p keeps writing the file if the terminal goes away (GNU coreutils 8.24+).
-echo "=== $(date '+%Y-%m-%d %H:%M:%S') ./deploy.sh $* (pid $$) ===" > "$TRANSCRIPT"
-if tee -p /dev/null </dev/null >/dev/null 2>&1; then TEE="tee -p"; else TEE="tee"; fi
-exec > >(trap '' HUP PIPE; $TEE -a "$TRANSCRIPT" 2>/dev/null) 2>&1
 
 backup_database() {
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
@@ -244,6 +274,11 @@ backup_database() {
   # Keep the newest $KEEP_BACKUPS; shared hosting quotas fill up quietly.
   ls -1t "$BACKUP_DIR"/db-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f
 }
+
+# Dependencies are out of date when composer.lock is newer than what composer
+# last installed. Judged from the files, not from what git pulled, so a manual
+# `git pull` before ./deploy.sh still gets its packages installed.
+composer_needed() { [ ! -f vendor/autoload.php ] || [ composer.lock -nt vendor/composer/installed.json ]; }
 
 composer_install() {
   if command -v composer >/dev/null 2>&1; then
@@ -325,11 +360,10 @@ if [ "$MODE" = "--rollback" ]; then
   warn "backup in $BACKUP_DIR instead of, or as well as, rolling back."
   read -r -p "Type 'yes' to continue: " reply
   [ "$reply" = "yes" ] || { echo "Skipped."; exit 0; }
-  LOCK_BEFORE=$(git rev-parse HEAD:composer.lock 2>/dev/null || echo none)
   # Detached checkout: the branch still tracks upstream, and the next normal
   # deploy (after the fix is pushed) returns to it with `git checkout -`.
   git checkout --quiet "$PREV"
-  [ "$LOCK_BEFORE" = "$(git rev-parse HEAD:composer.lock 2>/dev/null || echo none)" ] || composer_install
+  if composer_needed; then composer_install; fi
   finish
   log_deploy "ROLLBACK $CUR..$PREV"
   echo "✓ rolled back to $(git log --oneline -1). The checkout is detached; ./deploy.sh returns to the branch."
@@ -351,8 +385,6 @@ fi
 
 preflight
 BEFORE=$(git rev-parse --short HEAD)
-LOCK_BEFORE=$(git rev-parse HEAD:composer.lock 2>/dev/null || echo none)
-NEW_MIGRATIONS=$(git diff --name-only HEAD @{u} -- database/migrations | wc -l | tr -d ' ')
 
 if [ "$MODE" = "--down" ]; then
   say "maintenance mode on"
@@ -363,9 +395,11 @@ fi
 say "git pull"
 git pull --ff-only
 
-[ "$LOCK_BEFORE" = "$(git rev-parse HEAD:composer.lock 2>/dev/null || echo none)" ] || composer_install
+if composer_needed; then composer_install; fi
 
-if [ "$NEW_MIGRATIONS" -gt 0 ]; then
+# Back up whenever there is something to migrate, as Laravel sees it (not as
+# git diff sees it: a manual pull would hide new migrations from that).
+if $PHP artisan migrate:status --pending 2>/dev/null | grep -q 'Pending'; then
   backup_database
 fi
 say "migrate"
