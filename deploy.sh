@@ -39,6 +39,14 @@
 # - the full output of every changing run is kept in
 #   storage/logs/deploy-last.out, so a failed deploy can be read afterwards
 #   (cx.sh 38) instead of only in the terminal that ran it
+#
+# Version 3.2
+# - fixed: a run killed part-way (closed terminal, dropped ssh) left
+#   storage/framework/deploy.lock behind and blocked every later deploy.
+#   The lock now records its pid and a dead run's lock is cleared
+#   automatically; a dropped connection no longer stops a deploy half-way;
+#   the cleanup that releases the lock and lifts maintenance mode can no
+#   longer be killed by writing to a terminal that has gone
 #================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -139,33 +147,66 @@ fi
 #---------------------------------------------------------------
 # Changing modes: take the lock
 #---------------------------------------------------------------
-mkdir -p "$(dirname "$LOCK_FILE")"
-if [ -f "$LOCK_FILE" ]; then
-  die "Another deploy holds $LOCK_FILE (since $(cat "$LOCK_FILE")). If none is running, delete it and retry."
-fi
-date '+%Y-%m-%d %H:%M:%S' > "$LOCK_FILE"
-
-# Keep everything this run prints, for reading after the terminal is gone.
-TRANSCRIPT="storage/logs/deploy-last.out"
-mkdir -p storage/logs
-echo "=== $(date '+%Y-%m-%d %H:%M:%S') ./deploy.sh $* ===" > "$TRANSCRIPT"
-exec > >(tee -a "$TRANSCRIPT") 2>&1
-
+mkdir -p "$(dirname "$LOCK_FILE")" storage/logs
 WENT_DOWN=0
+
+# The lock holds "<pid> <start time>". A lock whose process is gone is left
+# over from a run that was killed (closed terminal, dropped ssh, kill -9) and
+# is cleared automatically. Locks written before v3.2 hold only a time; those
+# count as stale once they are 30 minutes old, far longer than any deploy.
+if [ -f "$LOCK_FILE" ]; then
+  read -r LPID LREST < "$LOCK_FILE" || true
+  if [[ "$LPID" =~ ^[0-9]+$ ]]; then
+    if kill -0 "$LPID" 2>/dev/null && ps -p "$LPID" -o args= 2>/dev/null | grep -q 'deploy\.sh'; then
+      die "A deploy is running right now (pid $LPID, started $LREST). Wait for it, or stop it with: kill $LPID"
+    fi
+  elif [ -n "$(find "$LOCK_FILE" -mmin -30 2>/dev/null)" ]; then
+    die "A deploy started at $(cat "$LOCK_FILE") may still be running. Check with: ps -u \$USER -o pid,args | grep '[d]eploy.sh' — if nothing shows, delete $LOCK_FILE and retry."
+  fi
+  warn "Clearing a stale lock from a run that did not finish (started $(cat "$LOCK_FILE"))."
+  warn "What it was doing: tail storage/logs/deploy.log storage/logs/deploy-last.out"
+  if [ -f storage/framework/down ]; then
+    warn "The site is still in maintenance mode, probably left by that run; it is brought back up at the end of this one."
+    WENT_DOWN=1
+  fi
+  log_deploy "STALE LOCK cleared ($(cat "$LOCK_FILE"))"
+  rm -f "$LOCK_FILE"
+fi
+# noclobber makes taking the lock atomic: if two deploys start at the same
+# moment, exactly one of them creates the file.
+( set -o noclobber; echo "$$ $(date '+%Y-%m-%d %H:%M:%S')" > "$LOCK_FILE" ) 2>/dev/null \
+  || die "Another deploy took the lock a moment ago."
+
 cleanup() {
   status=$?
-  if [ "$WENT_DOWN" = 1 ]; then
-    say "bringing the site back up"
-    $PHP artisan up || warn "artisan up failed — run it by hand (cx.sh 73)."
-  fi
+  # Ignore broken pipes from here on: if the terminal has gone, printing must
+  # not kill the cleanup before the lock is released and the site is back up.
+  trap '' PIPE HUP INT TERM
   rm -f "$LOCK_FILE"
+  if [ "$WENT_DOWN" = 1 ]; then
+    { say "bringing the site back up"; } 2>/dev/null || true
+    $PHP artisan up >> "$TRANSCRIPT" 2>&1 || { warn "artisan up failed — run it by hand (cx.sh 73)."; } 2>/dev/null || true
+  fi
   if [ $status -ne 0 ]; then
     log_deploy "FAILED $MODE at $(git rev-parse --short HEAD) (exit $status)"
-    echo "✗ deploy failed (exit $status). The code is at $(git log --oneline -1)."
-    echo "  Read the output above, then fix forward or run ./deploy.sh --rollback."
+    { echo "✗ deploy failed (exit $status). The code is at $(git log --oneline -1)."
+      echo "  Read the output above, then fix forward or run ./deploy.sh --rollback."; } 2>/dev/null || true
   fi
 }
+# Installed straight after taking the lock, so no exit path can skip it.
+TRANSCRIPT="storage/logs/deploy-last.out"
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# A dropped ssh connection sends SIGHUP. Finishing the deploy is safer than
+# stopping half-way through a pull or migration, so carry on.
+trap '' HUP
+
+# Keep everything this run prints, for reading after the terminal is gone.
+# tee -p keeps writing the file if the terminal goes away (GNU coreutils 8.24+).
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') ./deploy.sh $* (pid $$) ===" > "$TRANSCRIPT"
+if tee -p /dev/null </dev/null >/dev/null 2>&1; then TEE="tee -p"; else TEE="tee"; fi
+exec > >(trap '' HUP PIPE; $TEE -a "$TRANSCRIPT" 2>/dev/null) 2>&1
 
 backup_database() {
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
