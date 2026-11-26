@@ -52,8 +52,20 @@
 #   connection details come from the "nq" alias in ~/.ssh/config
 # - the run-on-the-server guard checks whether it is running inside the
 #   server's app folder, instead of comparing against a host name from vars.sh
+#
+# Version 3.3 — menu
+# - the menu stays open: after an option finishes, Enter brings it back
+#   (direct use, ./cx.sh 20, still runs one option and exits)
+# - grouped, two columns on wide terminals, colour on real terminals
+#   (NO_COLOR=1 turns it off); options that change live data are marked !
+# - status line: local commit, unpushed and uncommitted counts
+# - type words instead of a number to search ("backup", "logs err");
+#   a single match is offered to run
+# - one table (MENU) drives the menu, search, ./cx.sh list and validation,
+#   so a new option cannot appear in one place and be missing in another
+# - each option runs in a subshell: declining a confirmation returns to the
+#   menu instead of quitting cx.sh
 #================================================================
-clear
 cd "$(dirname "$0")"
 
 # Optional per-machine overrides (gitignored). Not needed for normal use.
@@ -77,7 +89,7 @@ if [ "$PWD" = "$HOME/$REMOTE_APP" ]; then
 fi
 
 # Fail early, with a useful message, if the ssh alias is missing.
-case "${1:-}" in qq|99) ;; *)
+case "${1:-}" in q|qq|99|list|help|-h|--help|"?") ;; *)
   # ssh -G resolves the alias; with no matching Host block, hostname stays the alias itself.
   if [ "$(ssh -G "$REMOTE" 2>/dev/null | awk '$1=="hostname"{print $2}')" = "$REMOTE" ] && [[ "$REMOTE" != *.* ]]; then
     echo "⚠ No ssh alias '$REMOTE' in ~/.ssh/config. Add one, e.g.:"
@@ -170,73 +182,163 @@ smoke_or_advise() {
   return 1
 }
 
-echo =============================================================
-echo "Hi $USER@$HOSTNAME — acting on $PROJECT (ssh $REMOTE:~/$REMOTE_APP)"
-echo What do you want to do?
-echo -------------------------------------------------------------
-echo "DEPLOY"
-echo "20 : DEPLOY: pull + composer + migrate + caches + verify"
-echo "21 : DEPLOY with maintenance mode during the deploy"
-echo "22 : WHAT'S LIVE: compare the server's HEAD with local"
-echo "23 : MIGRATIONS: status on the server"
-echo "24 : CACHES: rebuild config/routes/views"
-echo "25 : CACHES: clear everything (stale config after an .env edit)"
-echo "26 : COMPOSER: install production dependencies"
-echo "27 : DEPLOY CHECK: what would deploy (changes nothing)"
-echo "28 : ROLLBACK: code back to the commit before the last deploy"
-echo "29 : DEPLOY STATUS: current commit and deploy history"
-echo ----------------------------------------------
-echo DIAGNOSE
-echo "30 : HEALTH: smoke test $APP_URL — pages, /up, game assets"
-echo "31 : LOGS: tail the Laravel log"
-echo "32 : LOGS: recent errors"
-echo "33 : ARTISAN: run a command (e.g. 'route:list')"
-echo "34 : CONFIG: environment settings (secrets hidden)"
-echo "35 : DISK: what is using the account quota"
-echo "36 : LOGS: file sizes"
-echo "37 : SIGN-IN: Google / nikniq.com status and redirect URIs"
-echo "38 : LOGS: full output of the last deploy"
-echo "39 : DOCTOR: everything at a glance — start here when something is wrong"
-echo ----------------------------------------------
-echo "GAME"
-echo "40 : STATS: players, games and results"
-echo "41 : PLAYER: look up a player by email (support)"
-echo "42 : LEADERBOARD: fetch the live page"
-echo "43 : SCORES: audit for cheated results"
-echo "44 : SCORES: void one game  [removes its points]"
-echo ----------------------------------------------
-echo MAINTENANCE
-echo "70 : VERIFY: run the post-deploy checks on their own"
-echo "72 : MAINTENANCE MODE: on  [site goes down]"
-echo "73 : MAINTENANCE MODE: off"
-echo "74 : LOGS: truncate the Laravel log  [discards log history]"
-echo ----------------------------------------------
-echo "BACKUP"
-echo "90 : BACKUP: database now (SQLite copy or mysqldump)"
-echo "91 : BACKUP: run bk.sh (database and files, if installed via 03)"
-echo "92 : BACKUP: list backups on the server"
-echo "93 : BACKUP: download the newest database backup to ./backup"
-echo "94 : RESTORE: put a backup back  [replaces live data]"
-echo "95 : BACKUP: schedule a daily backup on the server (cron)"
-echo ----------------------------------------------
-echo ACCESS
-echo "00 : CONNECT: to $REMOTE"
-echo "01 : RSYNC: ssh settings and dotfiles to remote"
-echo "03 : SETUP BACKUP: copy bk.sh to remote"
-echo "05 : MONITOR: remote top"
-echo "06 : TERMINATE ACCESS: delete remote ssh directory"
-echo "99 : LOCAL FILE UPDATE and SECURITY SCRUB"
-echo "qq : Exit"
-echo =============================================================
-if [ -n "$1" ]; then
-  SELECTION=$1
-else
-  read -r -n 2 SELECTION
-fi
-PARAM2="${2:-}"
-echo
-echo "Your selection is : $SELECTION."
+#---------------------------------------------------------------
+# Menu: one table drives the menu, search, help and validation.
+# code|group|label|flag   flag: !=changes live data or takes the site down,
+#                               p=asks for a parameter
+#---------------------------------------------------------------
+MENU='
+20|DEPLOY|Deploy: pull, composer, migrate, caches, verify, smoke test|
+21|DEPLOY|Deploy with maintenance mode on during it|!
+27|DEPLOY|Deploy check: what would deploy (changes nothing)|
+22|DEPLOY|What is live: server HEAD vs local|
+29|DEPLOY|Deploy status and history|
+28|DEPLOY|Rollback code to the previous release|!
+23|DEPLOY|Migrations: status on the server|
+24|DEPLOY|Caches: rebuild config/routes/views|
+25|DEPLOY|Caches: clear everything (after an .env edit)|
+26|DEPLOY|Composer: install production dependencies|
+39|DIAGNOSE|DOCTOR: everything at a glance (start here)|
+30|DIAGNOSE|Health: smoke test pages, /up and game assets|
+31|DIAGNOSE|Logs: tail the Laravel log|
+32|DIAGNOSE|Logs: recent errors|
+38|DIAGNOSE|Logs: full output of the last deploy|
+36|DIAGNOSE|Logs: file sizes|
+33|DIAGNOSE|Artisan: run a command|p
+34|DIAGNOSE|Config: environment settings (secrets hidden)|
+35|DIAGNOSE|Disk: what uses the account quota|
+37|DIAGNOSE|Sign-in: Google / nikniq.com status and redirect URIs|
+40|GAME|Stats: players, games and results|
+41|GAME|Player: look up by email (support)|p
+42|GAME|Leaderboard: fetch the live page|
+43|GAME|Scores: audit for cheated results|
+44|GAME|Scores: void one game|!p
+70|MAINTENANCE|Verify: post-deploy checks on their own|
+72|MAINTENANCE|Maintenance mode ON (site goes down)|!
+73|MAINTENANCE|Maintenance mode off|
+74|MAINTENANCE|Logs: truncate the Laravel log|!
+90|BACKUP|Backup the database now|
+92|BACKUP|List backups on the server|
+93|BACKUP|Download the newest backup to ./backup|
+94|BACKUP|Restore a backup (replaces live data)|!p
+95|BACKUP|Schedule a daily backup (cron)|
+91|BACKUP|Run bk.sh (database and files)|p
+00|ACCESS|Connect: ssh to the server|
+05|ACCESS|Monitor: remote top|
+01|ACCESS|Copy ssh settings and dotfiles to the server|
+03|ACCESS|Copy bk.sh to the server|
+06|ACCESS|Terminate access: wipe remote ~/.ssh|!
+99|ACCESS|Local file update and security scrub|
+'
 
+# Colours only on a real terminal, and never when NO_COLOR is set.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+  B=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+else
+  B=''; DIM=''; RED=''; GRN=''; YEL=''; CYN=''; RST=''
+fi
+
+menu_rows() { printf '%s\n' "$MENU" | grep -E '^[0-9]{2}\|'; }
+menu_label() { menu_rows | awk -F'|' -v c="$1" '$1==c {print $3}'; }
+is_option()  { [ -n "$(menu_label "$1")" ]; }
+
+menu_item() {   # code label flag
+  local mark=' ' colour=''
+  case "$3" in *'!'*) mark="${RED}!${RST}"; colour="$RED" ;; esac
+  printf ' %s%s%s %s %s%s%s' "$B" "$1" "$RST" "$mark" "$colour" "$2" "$RST"
+}
+
+status_line() {
+  local head unpushed dirty
+  head=$(git log --oneline -1 --format='%h %s' 2>/dev/null | cut -c1-48)
+  unpushed=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
+  dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  printf '%s%s%s  →  ssh %s:~/%s\n' "$B" "$PROJECT" "$RST" "$REMOTE" "$REMOTE_APP"
+  printf '%slocal:%s %s' "$DIM" "$RST" "${head:-no git}"
+  [ "$unpushed" -gt 0 ] 2>/dev/null && printf '  %s%s unpushed%s' "$YEL" "$unpushed" "$RST"
+  [ "$dirty" -gt 0 ] && printf '  %s%s uncommitted%s' "$YEL" "$dirty" "$RST"
+  printf '\n'
+}
+
+show_menu() {
+  local cols width group last='' row code label flag left='' n=0
+  cols=$(tput cols 2>/dev/null || echo 80)
+  # Two columns when the terminal is wide enough, one otherwise.
+  if [ "$cols" -ge 120 ]; then width=$(( cols / 2 )); else width=0; fi
+  clear 2>/dev/null
+  printf '%s\n' "${DIM}$(printf '%*s' "$(( cols < 100 ? cols : 100 ))" '' | tr ' ' '─')${RST}"
+  status_line
+  printf '%s\n' "${DIM}$(printf '%*s' "$(( cols < 100 ? cols : 100 ))" '' | tr ' ' '─')${RST}"
+  while IFS='|' read -r code group label flag; do
+    if [ "$group" != "$last" ]; then
+      [ -n "$left" ] && { printf '%b\n' "$left"; left=''; }
+      printf '\n%s%s%s\n' "$CYN$B" "$group" "$RST"
+      last="$group"; n=0
+    fi
+    row=$(menu_item "$code" "$label" "$flag")
+    if [ "$width" -gt 0 ]; then
+      if [ -z "$left" ]; then
+        left="$row"
+      else
+        # pad the left cell by its visible length (colour codes have no width)
+        local plain; plain=$(printf '%s' "$left" | sed $'s/\e\\[[0-9;]*m//g')
+        printf '%s%*s%s\n' "$left" $(( width - ${#plain} )) '' "$row"; left=''
+      fi
+    else
+      printf '%s\n' "$row"
+    fi
+  done < <(menu_rows)
+  [ -n "$left" ] && printf '%s\n' "$left"
+  printf '\n%s! = changes live data or takes the site down (asks first)%s\n' "$DIM" "$RST"
+  printf '%sType a number, words to search (e.g. "backup"), ? for help, q to quit.%s\n' "$DIM" "$RST"
+}
+
+show_help() {
+  cat <<EOF
+
+${B}cx.sh${RST} — operations for $PROJECT, run from your own machine.
+
+  ./cx.sh             menu (returns here after each option)
+  ./cx.sh 39          run one option and exit
+  ./cx.sh 41 a@b.com  …with its parameter
+  ./cx.sh list        print every option (for scripts / grep)
+
+In the menu: a number runs it; any words search the labels; q quits.
+Overrides: CX_REMOTE, CX_PROJECT, CX_REMOTE_APP, CX_APP_URL, NO_COLOR=1.
+EOF
+}
+
+# Words → matching options. One match runs straight away (after showing it).
+search() {
+  local q="$1" hits n
+  hits=$(menu_rows | grep -i -- "$q" || true)
+  [ -z "$hits" ] && hits=$(menu_rows | awk -F'|' -v q="$q" 'BEGIN{IGNORECASE=1; n=split(q,w," ")} {ok=1; for(i=1;i<=n;i++) if (tolower($2" "$3) !~ tolower(w[i])) ok=0; if (ok) print}')
+  n=$(printf '%s' "$hits" | grep -c . || true)
+  if [ "$n" -eq 0 ]; then echo "No option matches \"$q\"."; return 1; fi
+  printf '%s\n' "$hits" | while IFS='|' read -r code group label flag; do menu_item "$code" "$label" "$flag"; printf '  %s%s%s\n' "$DIM" "$group" "$RST"; done
+  if [ "$n" -eq 1 ]; then
+    PICKED=$(printf '%s' "$hits" | cut -d'|' -f1)
+    return 0
+  fi
+  return 1
+}
+
+pause() { printf '\n%s' "${DIM}Enter for the menu, q to quit: ${RST}"; read -r k; [ "$k" = q ] && exit 0; }
+
+# Run one option in a subshell: an option that bails out (a declined
+# confirmation, a failed step) ends only itself, not the whole menu.
+run() {
+  local code="$1" label
+  label=$(menu_label "$code")
+  if [ -z "$label" ]; then echo "Not an option: $code (? for help)"; return 1; fi
+  printf '\n%s▶ %s  %s%s\n' "$B" "$code" "$label" "$RST"
+  ( SELECTION="$code"; PARAM2="${2:-}"; dispatch )
+}
+
+#---------------------------------------------------------------
+# Options
+#---------------------------------------------------------------
+dispatch() {
 case "$SELECTION" in
 
   #-------------------------------------------------------------
@@ -583,14 +685,43 @@ case "$SELECTION" in
   log_history "Refreshed files from default"
   ;;
 
-  "qq" | $'\e'* )
-  echo Quit
-  exit 0
-  ;;
-
   * )
-  echo
-  echo "Not a recognized option."
+  echo "Not a recognized option: $SELECTION"
+  return 1
   ;;
 
 esac
+}
+
+#---------------------------------------------------------------
+# Main
+#---------------------------------------------------------------
+case "${1:-}" in
+  "")       ;;                                    # interactive menu below
+  q|qq)     exit 0 ;;
+  -h|--help|help|'?') show_help; exit 0 ;;
+  list)     menu_rows | awk -F'|' '{printf "%s  %-12s %s%s\n", $1, $2, $3, ($4 ~ /!/ ? "  [!]" : "")}'; exit 0 ;;
+  *)        run "$1" "${2:-}"; exit $? ;;          # direct: ./cx.sh 20 [param]
+esac
+
+while true; do
+  show_menu
+  printf '\n%s' "${B}Option:${RST} "
+  read -r choice param || exit 0
+  case "$choice" in
+    q|qq|quit|exit) exit 0 ;;
+    '') continue ;;
+    '?'|help) show_help; pause; continue ;;
+  esac
+  if is_option "$choice"; then
+    run "$choice" "$param"; pause
+  else
+    PICKED=''
+    echo
+    if search "$choice${param:+ $param}" && [ -n "$PICKED" ]; then
+      printf '\nRun %s? [Y/n] ' "$PICKED"; read -r yn
+      case "$yn" in n|N) ;; *) run "$PICKED" ;; esac
+    fi
+    pause
+  fi
+done

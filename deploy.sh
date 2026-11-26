@@ -56,6 +56,10 @@
 # - composer install runs when composer.lock is newer than vendor/, and the
 #   pre-migration backup runs when Laravel reports pending migrations — both
 #   from the server's real state, so they still happen after a manual pull
+# - SiteGround has no /proc either: a lock whose process cannot be checked is
+#   trusted for 30 minutes, then treated as stale
+# - Composer's deprecation notices (old composer.phar on newer PHP) are
+#   filtered out of the output
 #================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -183,7 +187,10 @@ lock_holder_alive() {
   kill -0 "$1" 2>/dev/null || return 1
   if [ -r "/proc/$1/cmdline" ]; then tr '\0' ' ' < "/proc/$1/cmdline" | grep -q 'deploy\.sh'; return; fi
   if command -v ps >/dev/null 2>&1; then ps -p "$1" -o args= 2>/dev/null | grep -q 'deploy\.sh'; return; fi
-  return 0  # alive and cannot tell what it is: assume it is a deploy
+  # SiteGround has neither /proc nor ps, so what the pid is cannot be checked
+  # (it may have been reused by an unrelated process). Trust the lock while it
+  # is young enough to belong to a real deploy, and not after.
+  [ -n "$(find "$LOCK_FILE" -mmin -30 2>/dev/null)" ]
 }
 
 # The lock holds "<pid> <start time>". A lock whose process is gone is left
@@ -283,7 +290,14 @@ composer_needed() { [ ! -f vendor/autoload.php ] || [ composer.lock -nt vendor/c
 composer_install() {
   if command -v composer >/dev/null 2>&1; then
     say "composer install"
-    composer install --no-dev --optimize-autoloader --no-interaction
+    # SiteGround's Composer is older than its PHP and prints hundreds of
+    # "Deprecation Notice" lines that bury the real output; drop just those.
+    set +e
+    composer install --no-dev --optimize-autoloader --no-interaction 2>&1 \
+      | grep -v -e '^Deprecation Notice:' -e '^PHP Deprecated:'
+    rc=${PIPESTATUS[0]}
+    set -e
+    [ "$rc" -eq 0 ] || die "composer install failed (exit $rc)."
   else
     warn "composer.lock changed but composer is not on PATH. Install dependencies (cx.sh 26) before trusting this deploy."
   fi
