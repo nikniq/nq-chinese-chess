@@ -29,6 +29,20 @@
 # - 30 health-checks the home page, /up and the leaderboard over HTTPS
 # - the server-guard compares hostnames, so running cx.sh on the server
 #   stops instead of ssh-ing to itself
+#
+# Version 3.1
+# - every deploy (20/21), rollback (28) and restore (94) ends with a smoke
+#   test from here: pages, /up, and the game's JS and CSS. The server-side
+#   checks cannot see a broken web-server config; this can. A failed smoke
+#   test says how to roll back
+# - 30 now runs the same smoke test, including that engine.js is served as
+#   JavaScript (browsers refuse to start the game's Web Worker otherwise)
+# - 37 sign-in providers: what is on, the redirect URIs to register, and
+#   config mistakes; 38 reads the full output of the last deploy
+# - 39 DOCTOR: one screen with the live commit, server checks, smoke test,
+#   recent errors, newest backup and disk use — the first thing to run
+# - 43/44 score audit and voiding a cheated game (scores come from the browser)
+# - 94 restore a backup, 95 schedule a daily backup on the server
 #================================================================
 clear
 cd "$(dirname "$0")"
@@ -101,6 +115,36 @@ check_pushed() {
   echo
 }
 
+# Check the site from outside: what a player's browser actually gets.
+# Returns non-zero if anything failed, so callers can react.
+smoke() {
+  local fail=0 code ctype
+  echo "--- smoke test: $APP_URL ---"
+  for path in / /up /play /how-to-play /leaderboard /login; do
+    # curl prints the -w line (000 …) even when it cannot connect, so no fallback is needed.
+    code=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}s' --max-time 25 "$APP_URL$path" 2>/dev/null || true)
+    case "$code" in 200*) printf '  ✓ %-14s %s\n' "$path" "$code" ;; *) printf '  ✗ %-14s %s\n' "$path" "$code"; fail=1 ;; esac
+  done
+  for asset in js/engine.js js/xiangqi.js css/app.css; do
+    read -r code ctype < <(curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' --max-time 25 "$APP_URL/$asset" 2>/dev/null || true)
+    if [ "$code" != 200 ]; then printf '  ✗ /%-13s %s\n' "$asset" "$code"; fail=1
+    elif [ "${asset##*.}" = js ] && ! echo "$ctype" | grep -q javascript; then
+      printf '  ✗ /%-13s served as %s — the game engine will not start\n' "$asset" "$ctype"; fail=1
+    else printf '  ✓ /%-13s %s\n' "$asset" "$code"; fi
+  done
+  [ $fail = 0 ] && echo "✓ smoke test passed" || echo "✗ smoke test FAILED"
+  return $fail
+}
+
+# After anything that changes what is live.
+smoke_or_advise() {
+  echo
+  smoke && return 0
+  echo
+  echo "Read the deploy output (38) and the errors (32). To undo the code change: 28 (rollback)."
+  return 1
+}
+
 echo =============================================================
 echo "Hi $USER@$HOSTNAME — acting on $PROJECT ($REMOTE)"
 echo What do you want to do?
@@ -118,18 +162,23 @@ echo "28 : ROLLBACK: code back to the commit before the last deploy"
 echo "29 : DEPLOY STATUS: current commit and deploy history"
 echo ----------------------------------------------
 echo DIAGNOSE
-echo "30 : HEALTH: $APP_URL — home, /up, leaderboard"
+echo "30 : HEALTH: smoke test $APP_URL — pages, /up, game assets"
 echo "31 : LOGS: tail the Laravel log"
 echo "32 : LOGS: recent errors"
 echo "33 : ARTISAN: run a command (e.g. 'route:list')"
 echo "34 : CONFIG: environment settings (secrets hidden)"
 echo "35 : DISK: what is using the account quota"
 echo "36 : LOGS: file sizes"
+echo "37 : SIGN-IN: Google / nikniq.com status and redirect URIs"
+echo "38 : LOGS: full output of the last deploy"
+echo "39 : DOCTOR: everything at a glance — start here when something is wrong"
 echo ----------------------------------------------
 echo "GAME"
 echo "40 : STATS: players, games and results"
 echo "41 : PLAYER: look up a player by email (support)"
 echo "42 : LEADERBOARD: fetch the live page"
+echo "43 : SCORES: audit for cheated results"
+echo "44 : SCORES: void one game  [removes its points]"
 echo ----------------------------------------------
 echo MAINTENANCE
 echo "70 : VERIFY: run the post-deploy checks on their own"
@@ -142,6 +191,8 @@ echo "90 : BACKUP: database now (SQLite copy or mysqldump)"
 echo "91 : BACKUP: run bk.sh (database and files, if installed via 03)"
 echo "92 : BACKUP: list backups on the server"
 echo "93 : BACKUP: download the newest database backup to ./backup"
+echo "94 : RESTORE: put a backup back  [replaces live data]"
+echo "95 : BACKUP: schedule a daily backup on the server (cron)"
 echo ----------------------------------------------
 echo ACCESS
 echo "00 : CONNECT: to $REMOTE"
@@ -170,7 +221,8 @@ case "$SELECTION" in
   banner "DEPLOY: $PROJECT"
   check_pushed
   remote_tty "./deploy.sh" && log_history "Deployed $PROJECT ($(git rev-parse --short HEAD))" \
-    || { log_history "Deploy FAILED on $PROJECT"; exit 1; }
+    || { log_history "Deploy FAILED on $PROJECT"; echo "Full output: option 38."; exit 1; }
+  smoke_or_advise || log_history "Smoke test FAILED after deploy of $PROJECT"
   ;;
 
   "21" )
@@ -178,7 +230,8 @@ case "$SELECTION" in
   check_pushed
   confirm "$APP_URL returns 503 for the length of the deploy. deploy.sh brings it back up even if a step fails."
   remote_tty "./deploy.sh --down" && log_history "Deployed $PROJECT with maintenance mode" \
-    || { log_history "Deploy (--down) FAILED on $PROJECT"; exit 1; }
+    || { log_history "Deploy (--down) FAILED on $PROJECT"; echo "Full output: option 38."; exit 1; }
+  smoke_or_advise || log_history "Smoke test FAILED after deploy of $PROJECT"
   ;;
 
   "22" )
@@ -233,7 +286,7 @@ case "$SELECTION" in
   "28" )
   banner "ROLLBACK: $PROJECT"
   # deploy.sh asks for its own confirmation and shows the target commit.
-  remote_tty "./deploy.sh --rollback" && log_history "Rolled back $PROJECT"
+  remote_tty "./deploy.sh --rollback" && log_history "Rolled back $PROJECT" && smoke_or_advise
   ;;
 
   "29" )
@@ -246,14 +299,8 @@ case "$SELECTION" in
   #-------------------------------------------------------------
   "30" )
   banner "HEALTH: $APP_URL"
-  # Checked from here so it covers DNS, TLS and the web server, not just PHP.
-  for path in "" "/up" "/leaderboard"; do
-    printf '%-14s ' "${path:-/}"
-    curl -sS -o /dev/null -w '%{http_code}  %{time_total}s\n' --max-time 25 "$APP_URL$path" \
-      || echo "✗ no response"
-  done
-  echo
-  echo "Expect 200 for each. /up is Laravel's health route: 500 means the app failed to boot."
+  # From here, so it covers DNS, TLS and the web server, not just PHP.
+  smoke
   ;;
 
   "31" )
@@ -293,6 +340,43 @@ case "$SELECTION" in
   remote "ls -lh storage/logs/ 2>/dev/null | tail -n +2; echo; echo 'total:'; du -sh storage/logs 2>/dev/null"
   ;;
 
+  "37" )
+  banner "SIGN-IN providers on $PROJECT"
+  remote "php artisan ops:oauth --ping"
+  echo
+  echo "Register each redirect URI exactly (scheme, host and path) in that provider's console."
+  ;;
+
+  "38" )
+  banner "LAST DEPLOY output on $PROJECT"
+  remote "cat storage/logs/deploy-last.out 2>/dev/null || echo 'No transcript yet — it is written from deploy.sh v3.1 on.'"
+  ;;
+
+  "39" )
+  banner "DOCTOR: $PROJECT"
+  LOCAL_HEAD=$(git rev-parse --short HEAD 2>/dev/null)
+  SERVER_HEAD=$(remote "git rev-parse --short HEAD" 2>/dev/null | tr -d '\r')
+  echo "--- code ---"
+  if [ "$LOCAL_HEAD" = "$SERVER_HEAD" ]; then echo "  ✓ live is $SERVER_HEAD (matches local)"
+  else echo "  ⚠ live is ${SERVER_HEAD:-unknown}, local is $LOCAL_HEAD"; fi
+  remote "test -f storage/framework/down && echo '  ⚠ MAINTENANCE MODE IS ON (73 turns it off)'; test -f storage/framework/deploy.lock && echo \"  ⚠ deploy lock held since \$(cat storage/framework/deploy.lock)\"; tail -n 1 storage/logs/deploy.log 2>/dev/null | sed 's/^/  last: /'"
+  echo
+  echo "--- server checks ---"
+  remote "php artisan ops:verify-deploy" | grep -E '✗|passed|failed' || echo "  ✗ could not run ops:verify-deploy"
+  echo
+  smoke
+  echo
+  echo "--- errors in the last 24h ---"
+  remote "php artisan ops:errors --hours=24 --show=3"
+  echo
+  echo "--- backups ---"
+  remote "./deploy.sh --list-backups | sed -n '2p;\$p'"
+  remote "crontab -l 2>/dev/null | grep -qF 'deploy.sh --backup' && echo '  ✓ daily backup scheduled' || echo '  ⚠ no scheduled backup (95)'"
+  echo
+  echo "--- disk ---"
+  remote "du -sh . 2>/dev/null | sed 's/^/  app: /'; du -sh storage/logs 2>/dev/null | sed 's/^/  logs: /'"
+  ;;
+
   #-------------------------------------------------------------
   # GAME
   #-------------------------------------------------------------
@@ -313,6 +397,20 @@ case "$SELECTION" in
   curl -sS --max-time 25 "$APP_URL/leaderboard" | sed -n '/<table/,/<\/table>/p' \
     | sed -E 's/<[^>]+>/ /g; s/[[:space:]]+/ /g' | grep -v '^ *$' | head -30 \
     || echo "✗ could not fetch the leaderboard"
+  ;;
+
+  "43" )
+  banner "SCORES: audit on $PROJECT"
+  remote "php artisan chess:audit --days=${PARAM2:-7}"
+  echo
+  echo "Void a game with 44 <game id>. Look at the player first with 41 <email>."
+  ;;
+
+  "44" )
+  banner "SCORES: void a game on $PROJECT"
+  need_param "Game id (from 43 or 41)"
+  # chess:void-game prints the game and asks before deleting.
+  remote_tty "php artisan chess:void-game '$PARAM2'" && log_history "Voided game $PARAM2 on $PROJECT"
   ;;
 
   #-------------------------------------------------------------
@@ -362,8 +460,8 @@ case "$SELECTION" in
   ;;
 
   "92" )
-  banner "BACKUPS on the server (~/$REMOTE_BACKUPS)"
-  remote "ls -lht ~/$REMOTE_BACKUPS 2>/dev/null | head -20 || echo 'No backups yet.'"
+  banner "BACKUPS on $PROJECT"
+  remote "./deploy.sh --list-backups"
   ;;
 
   "93" )
@@ -376,6 +474,22 @@ case "$SELECTION" in
     $APP_SCP "$REMOTE:$NEWEST" ./backup/ && echo "✓ ./backup/$(basename "$NEWEST")  (gitignored — it holds player emails)"
     log_history "Downloaded backup $(basename "$NEWEST")"
   fi
+  ;;
+
+  "94" )
+  banner "RESTORE a backup on $PROJECT"
+  remote "./deploy.sh --list-backups"
+  echo
+  need_param "Backup file name to restore (e.g. db-20261126-031500.sqlite)"
+  # deploy.sh confirms, saves the current database first, and keeps the site
+  # in maintenance mode until the restore and migrations are done.
+  remote_tty "./deploy.sh --restore '$PARAM2'" && log_history "Restored $PARAM2 on $PROJECT" && smoke_or_advise
+  ;;
+
+  "95" )
+  banner "BACKUP: schedule daily on $PROJECT"
+  remote "./deploy.sh --install-cron"
+  log_history "Daily backup cron checked/installed on $PROJECT"
   ;;
 
   #-------------------------------------------------------------

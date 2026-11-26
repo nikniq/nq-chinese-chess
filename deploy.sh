@@ -8,6 +8,9 @@
 #   ./deploy.sh --rollback      # return code to the commit before the last deploy
 #   ./deploy.sh --status        # current commit, last deploys, pending migrations
 #   ./deploy.sh --backup        # back up the database now (cx.sh 90)
+#   ./deploy.sh --list-backups  # backups, newest first, with age and size (cx.sh 92)
+#   ./deploy.sh --restore FILE  # restore a backup (backs up the current DB first) (cx.sh 94)
+#   ./deploy.sh --install-cron  # daily 03:15 database backup via crontab (cx.sh 95)
 #
 # Its local counterpart is cx.sh (option 20 calls this over ssh).
 #
@@ -23,6 +26,19 @@
 #   before and after, which is what --rollback and --status read
 # - verification is a real command here (php artisan ops:verify-deploy)
 #   and a failure makes the script exit non-zero
+#
+# Version 3.1
+# - --restore: puts a backup back, with maintenance mode on, the current
+#   database saved first, and migrations re-run so an older backup still
+#   matches newer code. Backups existed before, but nothing could use them
+# - SQLite backups use `sqlite3 .backup` when available (a plain cp taken
+#   while a player is saving a score can copy a half-written file) and are
+#   integrity-checked; a backup that fails the check is deleted, not kept
+# - --list-backups and --install-cron (daily backup; until now backups only
+#   happened when a deploy brought migrations)
+# - the full output of every changing run is kept in
+#   storage/logs/deploy-last.out, so a failed deploy can be read afterwards
+#   (cx.sh 38) instead of only in the terminal that ran it
 #================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -57,6 +73,34 @@ if [ "$MODE" = "--status" ]; then
   echo
   $PHP artisan migrate:status --pending 2>/dev/null || true
   [ -f storage/framework/down ] && warn "Maintenance mode is ON."
+  exit 0
+fi
+
+if [ "$MODE" = "--list-backups" ]; then
+  if ! ls "$BACKUP_DIR"/db-* >/dev/null 2>&1; then echo "No backups in $BACKUP_DIR yet."; exit 0; fi
+  echo "Backups in $BACKUP_DIR (newest first):"
+  now=$(date +%s)
+  ls -1t "$BACKUP_DIR"/db-* | while read -r f; do
+    m=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")
+    printf '  %-34s %8s   %s ago\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)" \
+      "$(( (now - m) / 86400 ))d $(( (now - m) % 86400 / 3600 ))h"
+  done
+  newest=$(ls -1t "$BACKUP_DIR"/db-* | head -1)
+  age=$(( (now - $(stat -c %Y "$newest" 2>/dev/null || stat -f %m "$newest")) / 86400 ))
+  [ "$age" -ge 2 ] && warn "Newest backup is ${age} days old. ./deploy.sh --install-cron takes one daily."
+  exit 0
+fi
+
+if [ "$MODE" = "--install-cron" ]; then
+  # --backup needs no PHP, only cp/sqlite3/mysqldump, so cron's thin PATH is enough
+  # once the usual shared-hosting bin directories are added.
+  LINE="15 3 * * * cd $PWD && PATH=/usr/local/bin:/usr/bin:/bin ./deploy.sh --backup >> storage/logs/backup-cron.log 2>&1"
+  if crontab -l 2>/dev/null | grep -qF "./deploy.sh --backup"; then
+    echo "A backup cron line already exists:"; crontab -l | grep -F "./deploy.sh --backup"
+  else
+    { crontab -l 2>/dev/null || true; echo "$LINE"; } | crontab -
+    echo "✓ installed: $LINE"
+  fi
   exit 0
 fi
 
@@ -101,6 +145,12 @@ if [ -f "$LOCK_FILE" ]; then
 fi
 date '+%Y-%m-%d %H:%M:%S' > "$LOCK_FILE"
 
+# Keep everything this run prints, for reading after the terminal is gone.
+TRANSCRIPT="storage/logs/deploy-last.out"
+mkdir -p storage/logs
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') ./deploy.sh $* ===" > "$TRANSCRIPT"
+exec > >(tee -a "$TRANSCRIPT") 2>&1
+
 WENT_DOWN=0
 cleanup() {
   status=$?
@@ -124,8 +174,17 @@ backup_database() {
     sqlite|"")
       db=$(env_value DB_DATABASE); db="${db:-database/database.sqlite}"
       if [ -f "$db" ]; then
-        say "backup: $db → $BACKUP_DIR/db-$stamp.sqlite"
-        cp "$db" "$BACKUP_DIR/db-$stamp.sqlite"
+        dest="$BACKUP_DIR/db-$stamp.sqlite"
+        say "backup: $db → $dest"
+        if command -v sqlite3 >/dev/null 2>&1; then
+          sqlite3 "$db" ".backup '$dest'"
+          if [ "$(sqlite3 "$dest" 'PRAGMA integrity_check;')" != "ok" ]; then
+            rm -f "$dest"; die "Backup failed its integrity check and was deleted. Nothing else was changed."
+          fi
+        else
+          cp "$db" "$dest"
+        fi
+        LAST_BACKUP="$dest"
       else
         warn "SQLite file $db not found — no backup taken."
       fi ;;
@@ -135,6 +194,7 @@ backup_database() {
         MYSQL_PWD="$(env_value DB_PASSWORD)" mysqldump --single-transaction --no-tablespaces \
           -h "$(env_value DB_HOST)" -P "$(p=$(env_value DB_PORT); echo "${p:-3306}")" -u "$(env_value DB_USERNAME)" \
           "$(env_value DB_DATABASE)" | gzip > "$BACKUP_DIR/db-$stamp.sql.gz"
+        LAST_BACKUP="$BACKUP_DIR/db-$stamp.sql.gz"
       else
         warn "mysqldump not on PATH — no backup taken. Use cx.sh 91 before risky migrations."
       fi ;;
@@ -164,6 +224,48 @@ if [ "$MODE" = "--backup" ]; then
   backup_database
   ls -lht "$BACKUP_DIR" | sed -n '2,4p'
   log_deploy "BACKUP"
+  exit 0
+fi
+
+#---------------------------------------------------------------
+# Restore
+#---------------------------------------------------------------
+if [ "$MODE" = "--restore" ]; then
+  FILE="${2:-}"
+  [ -n "$FILE" ] || die "Usage: ./deploy.sh --restore <backup file>  (see ./deploy.sh --list-backups)"
+  [ -f "$FILE" ] || FILE="$BACKUP_DIR/$FILE"   # accept a bare file name from --list-backups
+  [ -f "$FILE" ] || die "No such backup: ${2}"
+  CONN="$(env_value DB_CONNECTION)"; CONN="${CONN:-sqlite}"
+  case "$CONN:$FILE" in
+    sqlite:*.sqlite|mysql:*.sql.gz|mariadb:*.sql.gz) ;;
+    *) die "$(basename "$FILE") does not match DB_CONNECTION=$CONN." ;;
+  esac
+  echo "Restore $(basename "$FILE") ($(du -h "$FILE" | cut -f1)) over the live $CONN database?"
+  warn "Every score and account created since that backup is lost. The current database is backed up first."
+  read -r -p "Type 'yes' to continue: " reply
+  [ "$reply" = "yes" ] || { echo "Skipped."; exit 0; }
+
+  LAST_BACKUP=""
+  backup_database
+  [ -n "$LAST_BACKUP" ] || die "Could not back up the current database, so it was not overwritten."
+  say "maintenance mode on"; $PHP artisan down --retry=60; WENT_DOWN=1
+  if [ "$CONN" = sqlite ]; then
+    db=$(env_value DB_DATABASE); db="${db:-database/database.sqlite}"
+    say "restore: $FILE → $db"
+    # Write next to the target and rename, so the live file is never half-copied;
+    # drop the WAL files of the old database so they are not replayed onto the new one.
+    cp "$FILE" "$db.restoring" && mv "$db.restoring" "$db" && rm -f "$db-wal" "$db-shm"
+  else
+    say "restore: $FILE → $(env_value DB_DATABASE)"
+    gunzip -c "$FILE" | MYSQL_PWD="$(env_value DB_PASSWORD)" mysql -h "$(env_value DB_HOST)" \
+      -P "$(p=$(env_value DB_PORT); echo "${p:-3306}")" -u "$(env_value DB_USERNAME)" "$(env_value DB_DATABASE)"
+  fi
+  say "migrate (bring an older backup up to the current schema)"
+  $PHP artisan migrate --force
+  $PHP artisan cache:clear >/dev/null 2>&1 || true   # leaderboard/home stats were cached from the old data
+  finish
+  log_deploy "RESTORE $(basename "$FILE") (previous DB saved as $(basename "$LAST_BACKUP"))"
+  echo "✓ restored $(basename "$FILE"). The database it replaced is $LAST_BACKUP."
   exit 0
 fi
 

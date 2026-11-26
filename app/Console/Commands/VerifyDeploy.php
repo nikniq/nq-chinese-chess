@@ -49,6 +49,13 @@ class VerifyDeploy extends Command
         $this->check('game assets present', fn () => is_file(public_path('js/xiangqi.js')) && is_file(public_path('js/engine.js')) && is_file(public_path('css/app.css')));
 
         $this->check('APP_KEY set', fn () => filled(config('app.key')));
+        $this->check('sign-in configuration', function () {
+            $problems = OAuthChecks::problems();
+            if ($problems) {
+                throw new \RuntimeException(implode(' ', $problems));
+            }
+            return true;
+        });
 
         if (app()->environment('production')) {
             $this->check('APP_DEBUG off in production', fn () => config('app.debug') === false);
